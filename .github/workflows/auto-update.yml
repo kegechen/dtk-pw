@@ -1,0 +1,240 @@
+name: auto-update
+on:
+  pull_request:
+    paths:
+      - debian/changelog
+  workflow_call:
+    secrets:
+      APP_ID:
+        description: 'GitHub App ID'
+        required: true
+      APP_PRIVATE_KEY:
+        description: 'GitHub App private key'
+        required: true
+
+jobs:
+  read-meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check_version.outputs.version }}
+      update: ${{ steps.check_version.outputs.update }}
+      refs: ${{ steps.create_ref.outputs.refs }}
+      major: ${{ steps.create_ref.outputs.major }}
+      minor: ${{ steps.create_ref.outputs.minor }}
+      patch: ${{ steps.create_ref.outputs.patch }}
+      updateBranch: ${{ steps.create_ref.outputs.updateBranch }}
+      topicBranch: ${{ steps.create_ref.outputs.topicBranch }}
+    steps:
+      # Checkout the pull request
+      - uses: actions/checkout@v3
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install dependencies for helper
+        run: |
+          npm install parse-git-config
+      - name: Get diff and check version update
+        id: check_version
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const helper = require('./scripts/helper.js');
+            const {data: pr} = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            helper.logWithHint('pr info:', pr);
+            const {data: diff} = await github.request(pr.diff_url);
+            helper.logWithHint('diff:', diff);
+            const versionPattern = /\+dtk \(\s*(\d+(\.\d+)*)\)/;
+            const result = versionPattern.exec(diff);
+            helper.logWithHint('result:', result);
+            let update, version;
+            if (result == null) {
+              update = false;
+              version = null;
+            } else {
+              update = true;
+              version = result[1];
+            }
+            console.log("update: ", update);
+            console.log("version: ", version);
+            core.setOutput("version", version);
+            core.setOutput("update", update);
+      - name: Get github token
+        if: steps.check_version.outputs.update == 'true'
+        id: get_token
+        uses: tibdex/github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+      - name: Read repo from meta file
+        if: steps.check_version.outputs.update == 'true'
+        id: create_ref
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.get_token.outputs.token }}
+          script: |
+            const helper = require('./scripts/helper.js');
+            const topicBranch = 'topic-update';
+            core.setOutput("topicBranch", topicBranch);
+            let refs = [];
+            try {
+              let submodules = helper.getSubmodules();
+              const topicRef = 'refs/heads/' + topicBranch;
+              let updateBranch = submodules[0].branch;
+              core.setOutput("updateBranch", updateBranch);
+              for (let submodule of submodules) {
+                let repo = submodule.name;
+                // get target branch sha and create a new ref
+                try {
+                  const {data: branchInfo} = await github.rest.repos.getBranch({
+                    owner: context.repo.owner,
+                    repo: repo,
+                    branch: updateBranch
+                  });
+                  const refSha = branchInfo.commit.sha;
+                  // create branch using a ref
+                  const {data: matchedRef} = await github.rest.git.listMatchingRefs({
+                    owner: context.repo.owner,
+                    repo: repo,
+                    ref: 'heads/' + topicBranch
+                  });
+                  console.log(matchedRef);
+                  let exist = false;
+                  for (let matched of matchedRef) {
+                    if (matched.ref == topicRef) {
+                      exist = true;
+                      break;
+                    }
+                  }
+                  console.log("topic branch exist: ", exist);
+                  console.log("topic branch: " + topicBranch + ", branch to update: " + updateBranch + ", sha: " + refSha);
+                  let response;
+                  if (exist) {
+                    response = await github.rest.git.updateRef({
+                      owner: context.repo.owner,
+                      repo: repo,
+                      ref: 'heads/' + topicBranch,
+                      sha: refSha,
+                      force: true
+                    });
+                    console.log(response);
+                  } else {
+                    response = await github.rest.git.createRef({
+                      owner: context.repo.owner,
+                      repo: repo,
+                      ref: topicRef,
+                      sha: refSha
+                    });
+                  }
+                  // store ref sha to array
+                  const ref = {
+                    repo: repo,
+                    sha: response.data.object.sha
+                  };
+                  refs.push(ref);
+                } catch(e) {
+                  console.log(e);
+                  continue;
+                }
+              }
+            } catch(e) {
+              console.log(e);
+            } finally {
+              core.setOutput("refs", refs);
+            }
+
+  deliver-prs:
+    needs: read-meta
+    runs-on: ubuntu-latest
+    if: needs.read-meta.outputs.update == 'true'
+    strategy:
+      matrix:
+        ref: ${{ fromJson(needs.read-meta.outputs.refs) }}
+    steps:
+        - uses: actions/checkout@v3
+          with:
+            repository: deepin-community/deepin-gbp-dch-plugins
+        - name: Build and install dch tool
+          run: |
+            sudo apt install -y devscripts
+            sudo apt build-dep -y .
+            dpkg-buildpackage -b -us -uc -ui
+            cd ..
+            sudo apt install -y ./deepin-gbp-dch-plugins*.deb
+        - uses: actions/checkout@v3
+          with:
+            repository: ${{ github.repository_owner }}/${{ matrix.ref.repo }}
+            ref: ${{ matrix.ref.sha }}
+            fetch-depth: 0
+        - name: Get github token
+          id: get_token
+          uses: tibdex/github-app-token@v1
+          with:
+            app_id: ${{ secrets.APP_ID }}
+            private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        - name: Get email
+          id: get_email
+          uses: evvanErb/get-github-email-by-username-action@v2.0
+          with:
+            github-username: ${{ github.event.pull_request.user.login }}
+            token: ${{ steps.get_token.outputs.token }}
+        - name: Generate changelog using gbp
+          id: generate_changelog
+          run: |
+            git config user.name "${{ github.event.pull_request.user.login }}"
+            git config user.email "${{ steps.get_email.outputs.email }}"
+            gbp deepin-changelog --spawn-editor=never --git-author --ignore-branch -N ${{ needs.read-meta.outputs.version }}
+            echo "changelog=$(cat debian/changelog | base64 -w 0)" >> $GITHUB_OUTPUT
+        - name: Update contents and create pull requests
+          uses: actions/github-script@v6
+          with:
+            github-token: ${{ steps.get_token.outputs.token }}
+            script: |
+              const changelog = "${{ steps.generate_changelog.outputs.changelog }}";
+              // get content sha for debian/changelog
+              const {data: contentInfo} = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: "${{ matrix.ref.repo }}",
+                path: "debian/changelog",
+                ref: "${{ matrix.ref.sha }}"
+              });
+              console.log(contentInfo);
+              // update content for debian/changelog
+              const {data: content} = await github.rest.repos.createOrUpdateFileContents({
+                owner: context.repo.owner,
+                repo: "${{ matrix.ref.repo }}",
+                path: "debian/changelog",
+                message: "chore: update changelog\n\nRelease ${{ needs.read-meta.outputs.version}}.",
+                branch: "${{ needs.read-meta.outputs.topicBranch }}",
+                content: changelog,
+                sha: contentInfo.sha,
+                committer: {
+                  name: "${{ github.event.pull_request.user.login }}",
+                  email: "${{ steps.get_email.outputs.email }}"
+                },
+                author: {
+                  name: "${{ github.event.pull_request.user.login }}",
+                  email: "${{ steps.get_email.outputs.email }}"
+                }
+              });
+              console.log(content);
+              // create pull request
+              const existence = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: "${{ matrix.ref.repo }}",
+                head: "${{ needs.read-meta.outputs.topicBranch }}",
+                base: "${{ needs.read-meta.outputs.updateBranch }}"
+              });
+              console.log(existence);
+              const {data: pr} = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: "${{ matrix.ref.repo }}",
+                title: "chore: update changelog",
+                body: "Release ${{ needs.read-meta.outputs.version}}.",
+                head: "${{ needs.read-meta.outputs.topicBranch }}",
+                base: "${{ needs.read-meta.outputs.updateBranch }}"
+              });
+              console.log(pr);

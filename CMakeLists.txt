@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.25)
+set(DTK_VERSION "5.6.9" CACHE STRING "DTK version.")
+project(dtk)
+option(BUILD_MODULES "Build modules" ON)
+
+if(BUILD_MODULES)
+    add_subdirectory(dtkcommon)
+    add_subdirectory(dtkcore)
+    add_subdirectory(dtkgui)
+    add_subdirectory(dtkwidget)
+    add_subdirectory(dtkdeclarative)
+endif()
