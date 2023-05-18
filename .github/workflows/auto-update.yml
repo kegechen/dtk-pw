@@ -18,12 +18,8 @@ jobs:
     outputs:
       version: ${{ steps.check_version.outputs.version }}
       update: ${{ steps.check_version.outputs.update }}
-      refs: ${{ steps.create_ref.outputs.refs }}
-      major: ${{ steps.create_ref.outputs.major }}
-      minor: ${{ steps.create_ref.outputs.minor }}
-      patch: ${{ steps.create_ref.outputs.patch }}
-      updateBranch: ${{ steps.create_ref.outputs.updateBranch }}
-      topicBranch: ${{ steps.create_ref.outputs.topicBranch }}
+      repos: ${{ steps.list_repos.outputs.repos }}
+      updateBranch: ${{ steps.list_repos.outputs.updateBranch }}
     steps:
       # Checkout the pull request
       - uses: actions/checkout@v3
@@ -69,90 +65,39 @@ jobs:
         with:
           app_id: ${{ secrets.APP_ID }}
           private_key: ${{ secrets.APP_PRIVATE_KEY }}
-      - name: Read repo from meta file
+      - name: List repos tracked
         if: steps.check_version.outputs.update == 'true'
-        id: create_ref
+        id: list_repos
         uses: actions/github-script@v6
         with:
           github-token: ${{ steps.get_token.outputs.token }}
           script: |
             const helper = require('./scripts/helper.js');
-            const topicBranch = 'topic-update';
-            core.setOutput("topicBranch", topicBranch);
-            let refs = [];
-            try {
-              let submodules = helper.getSubmodules();
-              const topicRef = 'refs/heads/' + topicBranch;
-              let updateBranch = submodules[0].branch;
-              core.setOutput("updateBranch", updateBranch);
+            const updateBranch = context.payload.pull_request.base.ref;
+            let repos = [];
+            let submodules = helper.getSubmodules();
+            const repoNum = submodules.length;
+            if (!repoNum) {
+              core.setFailed("No submodules found!");
+            } else {
               for (let submodule of submodules) {
                 let repo = submodule.name;
-                // get target branch sha and create a new ref
-                try {
-                  const {data: branchInfo} = await github.rest.repos.getBranch({
-                    owner: context.repo.owner,
-                    repo: repo,
-                    branch: updateBranch
-                  });
-                  const refSha = branchInfo.commit.sha;
-                  // create branch using a ref
-                  const {data: matchedRef} = await github.rest.git.listMatchingRefs({
-                    owner: context.repo.owner,
-                    repo: repo,
-                    ref: 'heads/' + topicBranch
-                  });
-                  console.log(matchedRef);
-                  let exist = false;
-                  for (let matched of matchedRef) {
-                    if (matched.ref == topicRef) {
-                      exist = true;
-                      break;
-                    }
-                  }
-                  console.log("topic branch exist: ", exist);
-                  console.log("topic branch: " + topicBranch + ", branch to update: " + updateBranch + ", sha: " + refSha);
-                  let response;
-                  if (exist) {
-                    response = await github.rest.git.updateRef({
-                      owner: context.repo.owner,
-                      repo: repo,
-                      ref: 'heads/' + topicBranch,
-                      sha: refSha,
-                      force: true
-                    });
-                    console.log(response);
-                  } else {
-                    response = await github.rest.git.createRef({
-                      owner: context.repo.owner,
-                      repo: repo,
-                      ref: topicRef,
-                      sha: refSha
-                    });
-                  }
-                  // store ref sha to array
-                  const ref = {
-                    repo: repo,
-                    sha: response.data.object.sha
-                  };
-                  refs.push(ref);
-                } catch(e) {
-                  console.log(e);
-                  continue;
+                if (submodule.branch != updateBranch) {
+                  core.setFailed("All submodules must track the same branch as dtk!");
                 }
+                repos.push(repo);
               }
-            } catch(e) {
-              console.log(e);
-            } finally {
-              core.setOutput("refs", refs);
             }
+            core.setOutput("repos", repos);
+            core.setOutput("updateBranch", updateBranch);
 
-  deliver-prs:
+  deliver-pr:
     needs: read-meta
     runs-on: ubuntu-latest
     if: needs.read-meta.outputs.update == 'true'
     strategy:
       matrix:
-        ref: ${{ fromJson(needs.read-meta.outputs.refs) }}
+        repo: ${{ fromJson(needs.read-meta.outputs.repos) }}
     steps:
         - uses: actions/checkout@v3
           with:
@@ -166,8 +111,8 @@ jobs:
             sudo apt install -y ./deepin-gbp-dch-plugins*.deb
         - uses: actions/checkout@v3
           with:
-            repository: ${{ github.repository_owner }}/${{ matrix.ref.repo }}
-            ref: ${{ matrix.ref.sha }}
+            repository: ${{ github.repository_owner }}/${{ matrix.repo }}
+            ref: ${{ needs.read-meta.outputs.updateBranch }}
             fetch-depth: 0
         - name: Get github token
           id: get_token
@@ -184,57 +129,132 @@ jobs:
         - name: Generate changelog using gbp
           id: generate_changelog
           run: |
+            set -x
             git config user.name "${{ github.event.pull_request.user.login }}"
             git config user.email "${{ steps.get_email.outputs.email }}"
-            gbp deepin-changelog --spawn-editor=never --git-author --ignore-branch -N ${{ needs.read-meta.outputs.version }}
+            gbp deepin-changelog --spawn-editor=never --distribution=unstable --force-distribution --git-author --ignore-branch -N ${{ needs.read-meta.outputs.version }}
             echo "changelog=$(cat debian/changelog | base64 -w 0)" >> $GITHUB_OUTPUT
         - name: Update contents and create pull requests
+          id: create_pr
+          uses: actions/github-script@v6
+          with:
+            github-token: ${{ steps.get_token.outputs.token }}
+            result-encoding: string
+            script: |
+              const updateBranch = '${{ needs.read-meta.outputs.updateBranch }}';
+              const topicBranch = 'topic-update';
+              const repo = '${{ matrix.repo }}';
+              const version = '${{ needs.read-meta.outputs.version}}';
+              const { data: changelogBlob } = await github.rest.git.createBlob({
+                owner: context.repo.owner,
+                repo: repo,
+                content: '${{ steps.generate_changelog.outputs.changelog }}',
+                encoding: 'base64'
+              });
+              console.log(changelogBlob);
+              const changelog = {
+                path: 'debian/changelog',
+                mode: '100644',
+                type: 'blob',
+                sha: changelogBlob.sha
+              }
+              const identity = {
+                name: '${{ github.event.pull_request.user.login }}',
+                email: '${{ steps.get_email.outputs.email }}'
+              };
+              const {data: base} = await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: repo,
+                branch: updateBranch
+              });
+              const baseSha = base.commit.sha;
+              const {data: newTree} = await github.rest.git.createTree({
+                owner: context.repo.owner,
+                repo: repo,
+                tree: [changelog],
+                base_tree: baseSha
+              });
+              const {data: newCommit} = await github.rest.git.createCommit({
+                owner: context.repo.owner,
+                repo: repo,
+                message: `chore: update changelog\n\nRelease ${version}.`,
+                tree: newTree.sha,
+                parents: [baseSha],
+                committer: identity,
+                author: identity
+              });
+              const {data: matchedRef} = await github.rest.git.listMatchingRefs({
+                owner: context.repo.owner,
+                repo: repo,
+                ref: `heads/${topicBranch}`
+              });
+              console.log(matchedRef);
+              let exist = false;
+              for (let matched of matchedRef) {
+                if (matched.ref == `refs/heads/${topicBranch}`) {
+                  exist = true;
+                  break;
+                }
+              }
+              console.log("topic branch exist: ", exist);
+              console.log("topic branch: " + topicBranch + ", branch to update: " + updateBranch);
+              try {
+                if (exist) {
+                  await github.rest.git.updateRef({
+                    owner: context.repo.owner,
+                    repo: repo,
+                    ref: `heads/${topicBranch}`,
+                    sha: newCommit.sha,
+                    force: true
+                  });
+                } else {
+                  await github.rest.git.createRef({
+                    owner: context.repo.owner,
+                    repo: repo,
+                    ref: `heads/${topicBranch}`,
+                    sha: newCommit.sha
+                  });
+                }
+              } catch (e) {
+                console.log(e);
+                core.setFailed(e.message);
+              }
+              // create pull request
+              const {data: prs} = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: repo,
+                head: `${context.repo.owner}:${topicBranch}`,
+                base: `${updateBranch}`
+              });
+              console.log("prs exist: ", prs);
+              let prInfo;
+              if (prs.length == 0) {
+                const { data: pr } = await github.rest.pulls.create({
+                  owner: context.repo.owner,
+                  repo: repo,
+                  title: 'chore: update changelog',
+                  body: `Release ${version}.`,
+                  head: topicBranch,
+                  base: updateBranch
+                });
+                core.setOutput('prNumber', pr.number);
+                return pr.html_url;
+              } else {
+                core.setOutput('prNumber', prs[0].number);
+                return prs[0].html_url;
+              }
+
+        - name: Create PR status
           uses: actions/github-script@v6
           with:
             github-token: ${{ steps.get_token.outputs.token }}
             script: |
-              const changelog = "${{ steps.generate_changelog.outputs.changelog }}";
-              // get content sha for debian/changelog
-              const {data: contentInfo} = await github.rest.repos.getContent({
+              await github.rest.repos.createCommitStatus({
                 owner: context.repo.owner,
-                repo: "${{ matrix.ref.repo }}",
-                path: "debian/changelog",
-                ref: "${{ matrix.ref.sha }}"
+                repo: context.repo.repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'pending',
+                context: 'auto-update / check-update (${{ matrix.repo }})',
+                target_url: '${{ steps.create_pr.outputs.result }}',
+                description: 'Waiting for checks to complete...'
               });
-              console.log(contentInfo);
-              // update content for debian/changelog
-              const {data: content} = await github.rest.repos.createOrUpdateFileContents({
-                owner: context.repo.owner,
-                repo: "${{ matrix.ref.repo }}",
-                path: "debian/changelog",
-                message: "chore: update changelog\n\nRelease ${{ needs.read-meta.outputs.version}}.",
-                branch: "${{ needs.read-meta.outputs.topicBranch }}",
-                content: changelog,
-                sha: contentInfo.sha,
-                committer: {
-                  name: "${{ github.event.pull_request.user.login }}",
-                  email: "${{ steps.get_email.outputs.email }}"
-                },
-                author: {
-                  name: "${{ github.event.pull_request.user.login }}",
-                  email: "${{ steps.get_email.outputs.email }}"
-                }
-              });
-              console.log(content);
-              // create pull request
-              const existence = await github.rest.pulls.list({
-                owner: context.repo.owner,
-                repo: "${{ matrix.ref.repo }}",
-                head: "${{ needs.read-meta.outputs.topicBranch }}",
-                base: "${{ needs.read-meta.outputs.updateBranch }}"
-              });
-              console.log(existence);
-              const {data: pr} = await github.rest.pulls.create({
-                owner: context.repo.owner,
-                repo: "${{ matrix.ref.repo }}",
-                title: "chore: update changelog",
-                body: "Release ${{ needs.read-meta.outputs.version}}.",
-                head: "${{ needs.read-meta.outputs.topicBranch }}",
-                base: "${{ needs.read-meta.outputs.updateBranch }}"
-              });
-              console.log(pr);

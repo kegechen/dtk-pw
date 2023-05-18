@@ -1,8 +1,5 @@
-name: sync-modules
+name: update-modules
 on:
-  push:
-    paths:
-      - debian/changelog
   workflow_call:
     secrets:
       APP_ID:
@@ -14,7 +11,6 @@ on:
 
 jobs:
   sync-repos:
-    if: failure()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
