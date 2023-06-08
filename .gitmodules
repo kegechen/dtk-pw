@@ -1,20 +1,20 @@
 [submodule "dtkcommon"]
 	path = dtkcommon
 	url = https://github.com/peeweep-test/dtkcommon
-	branch = release/5.6
+	branch = master
 [submodule "dtkcore"]
 	path = dtkcore
 	url = https://github.com/peeweep-test/dtkcore
-	branch = release/5.6
+	branch = master
 [submodule "dtkgui"]
 	path = dtkgui
 	url = https://github.com/peeweep-test/dtkgui
-	branch = release/5.6
+	branch = master
 [submodule "dtkwidget"]
 	path = dtkwidget
 	url = https://github.com/peeweep-test/dtkwidget
-	branch = release/5.6
+	branch = master
 [submodule "dtkdeclarative"]
 	path = dtkdeclarative
 	url = https://github.com/peeweep-test/dtkdeclarative
-	branch = release/5.6
+	branch = master
