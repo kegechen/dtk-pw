@@ -1,8 +1,5 @@
 name: auto-update
 on:
-  pull_request:
-    paths:
-      - debian/changelog
   workflow_call:
     secrets:
       APP_ID:
