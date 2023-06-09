@@ -1,3 +1,12 @@
+dtk (5.6.14) unstable; urgency=medium
+
+  * Disable all workflows.
+  * chore: correct submodule track branch
+  * chore: update submodules
+  * chore: remove workflows
+
+ -- Deepin Packages Builder <packages@deepin.org>  Fri, 09 Jun 2023 10:50:51 +0800
+
 dtk (5.6.13) unstable; urgency=medium
 
   * Release 5.6.13.
